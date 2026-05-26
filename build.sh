@@ -1,32 +1,135 @@
-FROM public.ecr.aws/amazonlinux/amazonlinux:2
+#!/bin/bash
+source /opt/buildpiper/shell-functions/functions.sh
+source /opt/buildpiper/shell-functions/log-functions.sh
+source /opt/buildpiper/shell-functions/str-functions.sh
+source /opt/buildpiper/shell-functions/file-functions.sh
+source /opt/buildpiper/shell-functions/aws-functions.sh
 
-RUN yum install -y \
-    bash \
-    unzip \
-    curl \
-    jq \
-    groff \
-    less \
-    shadow-utils \
-    && yum clean all
+if [ "$DEBUG" = true ]; then
+  set -x
+fi
 
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && \
-    unzip awscliv2.zip && \
-    ./aws/install && \
-    rm -rf awscliv2.zip aws
+# ----------------------------
+# IAM ROLE ASSUMPTION
+# ----------------------------
+if [ "$ASSUME_OTHER_ROLE" == true ]; then
+  role_output=$(aws sts assume-role \
+    --role-arn arn:aws:iam::$ACCOUNT_ID:role/$ROLE_NAME \
+    --role-session-name $ROLE_SESSION_NAME)
 
-RUN groupadd -g 65522 buildpiper && \
-    useradd -u 65522 -g 65522 -m -s /bin/bash buildpiper
+  if [ $? -ne 0 ]; then
+    logErrorMessage "ERROR: Failed to assume role."
+    exit 1
+  fi
 
-RUN mkdir -p /opt/buildpiper/shell-functions
+  export AWS_ACCESS_KEY_ID=$(logInfoMessage $role_output | jq -r '.Credentials.AccessKeyId')
+  export AWS_SECRET_ACCESS_KEY=$(logInfoMessage $role_output | jq -r '.Credentials.SecretAccessKey')
+  export AWS_SESSION_TOKEN=$(logInfoMessage $role_output | jq -r '.Credentials.SessionToken')
+fi
 
-COPY BP-BASE-SHELL-STEPS /opt/buildpiper/shell-functions/
-COPY build.sh /opt/buildpiper/build.sh
+# ----------------------------
+# INPUTS
+# ----------------------------
+TAG_KEY=${TAG_KEY}
+TAG_VALUE=${TAG_VALUE}
+ACTION=${ACTION}               # Set | ScaleUp | ScaleDown
+DESIRED_CAPACITY=${DESIRED_CAPACITY}
 
-RUN chown -R buildpiper:buildpiper /opt/buildpiper && \
-    chmod +x /opt/buildpiper/build.sh
+logInfoMessage "-------------------------------------"
+logInfoMessage "ASG TAG     : $TAG_KEY=$TAG_VALUE"
+logInfoMessage "ACTION      : $ACTION"
+logInfoMessage "VALUE       : $DESIRED_CAPACITY"
+logInfoMessage "-------------------------------------"
 
-USER buildpiper
-WORKDIR /opt/buildpiper
+# ----------------------------
+# GET ASGs
+# ----------------------------
+ASG_NAMES=$(aws autoscaling describe-tags \
+  --filters "Name=key,Values=$TAG_KEY" "Name=value,Values=$TAG_VALUE" \
+  --query "Tags[].ResourceId" \
+  --output text)
 
-ENTRYPOINT ["./build.sh"]
+if [ -z "$ASG_NAMES" ]; then
+  logErrorMessage "No matching ASGs found."
+  exit 0
+fi
+
+logInfoMessage "Found ASGs: $ASG_NAMES"
+
+FAILED=""
+
+# ----------------------------
+# PROCESS ASGs
+# ----------------------------
+for asg in $ASG_NAMES; do
+  logInfoMessage "====================================="
+  logInfoMessage "Processing ASG: $asg"
+
+  CURRENT_DESIRED=$(aws autoscaling describe-auto-scaling-groups \
+    --auto-scaling-group-names "$asg" \
+    --query "AutoScalingGroups[0].DesiredCapacity" \
+    --output text)
+
+  logInfoMessage "Current Desired Capacity: $CURRENT_DESIRED"
+
+  # ----------------------------
+  # CALCULATE NEW DESIRED
+  # ----------------------------
+  if [ "$ACTION" == "Set" ]; then
+    NEW_DESIRED=$DESIRED_CAPACITY
+
+  elif [ "$ACTION" == "ScaleUp" ]; then
+    NEW_DESIRED=$((CURRENT_DESIRED + DESIRED_CAPACITY))
+
+  elif [ "$ACTION" == "ScaleDown" ]; then
+    NEW_DESIRED=$((CURRENT_DESIRED - DESIRED_CAPACITY))
+
+  else
+    logErrorMessage "ERROR: Invalid ACTION"
+    exit 1
+  fi
+
+  # Safety
+  if [ "$NEW_DESIRED" -lt 0 ]; then
+    NEW_DESIRED=0
+  fi
+
+  logInfoMessage "Final Desired Capacity => $NEW_DESIRED"
+
+  # ----------------------------
+  #  KEY FIX: FIRST SET MIN/MAX SAME VALUE
+  # ----------------------------
+  logInfoMessage "Setting MIN/MAX equal to DesiredCapacity..."
+
+  aws autoscaling update-auto-scaling-group \
+    --auto-scaling-group-name "$asg" \
+    --min-size "$NEW_DESIRED" \
+    --max-size "$NEW_DESIRED"
+
+  # ----------------------------
+  # THEN SET DESIRED
+  # ----------------------------
+  aws autoscaling update-auto-scaling-group \
+    --auto-scaling-group-name "$asg" \
+    --desired-capacity "$NEW_DESIRED"
+
+  if [ $? -ne 0 ]; then
+    logErrorMessage "FAILED: Update failed for $asg"
+    FAILED="$FAILED\n$asg"
+    continue
+  fi
+
+  logInfoMessage "SUCCESS: ASG locked to $NEW_DESIRED"
+done
+
+# ----------------------------
+# FINAL RESULT
+# ----------------------------
+logInfoMessage "====================================="
+
+if [ -n "$FAILED" ]; then
+  logErrorMessage -e "Some ASG updates failed:\n$FAILED"
+  exit 1
+else
+  logInfoMessage "All ASG operations completed successfully."
+fi
