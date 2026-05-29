@@ -22,9 +22,12 @@ if [ "$ASSUME_OTHER_ROLE" == true ]; then
     exit 1
   fi
 
-  export AWS_ACCESS_KEY_ID=$(logInfoMessage $role_output | jq -r '.Credentials.AccessKeyId')
-  export AWS_SECRET_ACCESS_KEY=$(logInfoMessage $role_output | jq -r '.Credentials.SecretAccessKey')
-  export AWS_SESSION_TOKEN=$(logInfoMessage $role_output | jq -r '.Credentials.SessionToken')
+  export AWS_ACCESS_KEY_ID=$(echo $role_output | jq -r '.Credentials.AccessKeyId')
+  export AWS_SECRET_ACCESS_KEY=$(echo $role_output | jq -r '.Credentials.SecretAccessKey')
+  export AWS_SESSION_TOKEN=$(echo $role_output | jq -r '.Credentials.SessionToken')
+
+  logInfoMessage "Assumed Role Identity:"
+  aws sts get-caller-identity --region "$AWS_REGION"
 fi
 
 # ----------------------------
@@ -50,7 +53,7 @@ ASG_NAMES=$(aws autoscaling describe-tags \
   --output text)
 
 if [ -z "$ASG_NAMES" ]; then
-  logErrorMessage "No matching ASGs found."
+  echo "No matching ASGs found."
   exit 0
 fi
 
@@ -125,10 +128,10 @@ done
 # ----------------------------
 # FINAL RESULT
 # ----------------------------
-logInfoMessage "====================================="
+echo "====================================="
 
 if [ -n "$FAILED" ]; then
-  logErrorMessage -e "Some ASG updates failed:\n$FAILED"
+  echo -e "Some ASG updates failed:\n$FAILED"
   exit 1
 else
   logInfoMessage "All ASG operations completed successfully."
